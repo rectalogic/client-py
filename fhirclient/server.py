@@ -4,14 +4,22 @@ import json
 import requests
 import urllib
 import logging
+import importlib
 try:                                # Python 2.x
     import urlparse
 except ImportError as e:            # Python 3
     import urllib.parse as urlparse
 
-from auth import FHIRAuth
+from .auth import FHIRAuth
+from .constants import FHIRVersion
 
-FHIRJSONMimeType = 'application/fhir+json'
+# DSTU2 is application/json+fhir, STU3/R4 is application/fhir+json
+# https://www.hl7.org/fhir/DSTU2/http.html#mime-type
+# https://www.hl7.org/fhir/R4/http.html#mime-type
+FHIRJSONMimeTypes = {
+    FHIRVersion.DSTU2: "application/json+fhir"
+}
+FHIRJSONMimeTypeDefault = 'application/fhir+json'
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +49,8 @@ class FHIRServer(object):
     """ Handles talking to a FHIR server.
     """
     
-    def __init__(self, client, base_uri=None, state=None):
+    def __init__(self, client, base_uri=None, state=None, version=None):
+        self.version = client.version if (version is None and client) else (version or FHIRVersion.DEFAULT)
         self.client = client
         self.auth = None
         self.base_uri = None
@@ -56,7 +65,7 @@ class FHIRServer(object):
         if base_uri is not None and len(base_uri) > 10:
             self.base_uri = base_uri if '/' == base_uri[-1] else base_uri + '/'
             self.aud = base_uri
-        self._capability = None
+        self._statement = None
         if state is not None:
             self.from_state(state)
         if not self.base_uri or len(self.base_uri) <= 10:
@@ -67,22 +76,27 @@ class FHIRServer(object):
             self.client.save_state()
     
     
-    # MARK: Server CapabilityStatement
+    # MARK: Server CapabilityStatement/Conformance
     
     @property
-    def capabilityStatement(self):
-        self.get_capability()
-        return self._capability
+    def statement(self):
+        self.get_statement()
+        return self._statement
     
-    def get_capability(self, force=False):
-        """ Returns the server's CapabilityStatement, retrieving it if needed
+    def get_statement(self, force=False):
+        """ Returns the server's CapabilityStatement/Conformance, retrieving it if needed
         or forced.
         """
-        if self._capability is None or force:
-            logger.info('Fetching CapabilityStatement from {0}'.format(self.base_uri))
-            from models import capabilitystatement
-            conf = capabilitystatement.CapabilityStatement.read_from('metadata', self)
-            self._capability = conf
+        if self._statement is None or force:
+            if self.version == FHIRVersion.DSTU2:
+                logger.info('Fetching Conformance statement from {0}'.format(self.base_uri))
+                conformance = importlib.import_module("fhirclient.models.{}.conformance".format(self.version))
+                conf = conformance.Conformance.read_from('metadata', self)
+            else:
+                logger.info('Fetching CapabilityStatement from {0}'.format(self.base_uri))
+                capabilitystatement = importlib.import_module("fhirclient.models.{}.capabilitystatement".format(self.version))
+                conf = capabilitystatement.CapabilityStatement.read_from('metadata', self)
+            self._statement = conf
             
             security = None
             try:
@@ -96,9 +110,8 @@ class FHIRServer(object):
                 'app_secret': self.client.app_secret if self.client is not None else None,
                 'redirect_uri': self.client.redirect if self.client is not None else None,
             }
-            self.auth = FHIRAuth.from_capability_security(security, settings)
+            self.auth = FHIRAuth.from_security(security, settings)
             self.should_save_state()
-    
     
     # MARK: Authorization
     
@@ -113,7 +126,7 @@ class FHIRServer(object):
     @property
     def authorize_uri(self):
         if self.auth is None:
-            self.get_capability()
+            self.get_statement()
         return self.auth.authorize_uri(self)
     
     def handle_callback(self, url):
@@ -147,7 +160,7 @@ class FHIRServer(object):
         :returns: True if the server can make authenticated calls
         """
         if self.auth is None:
-            self.get_capability()
+            self.get_statement()
         return self.auth.ready if self.auth is not None else False
     
     def request_json(self, path, nosign=False):
@@ -180,7 +193,7 @@ class FHIRServer(object):
         url = urlparse.urljoin(self.base_uri, path)
         
         header_defaults = {
-            'Accept': FHIRJSONMimeType,
+            'Accept': FHIRJSONMimeTypes.get(self.version, FHIRJSONMimeTypeDefault),
             'Accept-Charset': 'UTF-8',
         }
         # merge in user headers with defaults
@@ -207,8 +220,8 @@ class FHIRServer(object):
         """
         url = urlparse.urljoin(self.base_uri, path)
         headers = {
-            'Content-type': FHIRJSONMimeType,
-            'Accept': FHIRJSONMimeType,
+            'Content-type': FHIRJSONMimeTypes.get(self.version, FHIRJSONMimeTypeDefault),
+            'Accept': FHIRJSONMimeTypes.get(self.version, FHIRJSONMimeTypeDefault),
             'Accept-Charset': 'UTF-8',
         }
         if not nosign and self.auth is not None and self.auth.can_sign_headers():
@@ -231,8 +244,8 @@ class FHIRServer(object):
         """
         url = urlparse.urljoin(self.base_uri, path)
         headers = {
-            'Content-type': FHIRJSONMimeType,
-            'Accept': FHIRJSONMimeType,
+            'Content-type': FHIRJSONMimeTypes.get(self.version, FHIRJSONMimeTypeDefault),
+            'Accept': FHIRJSONMimeTypes.get(self.version, FHIRJSONMimeTypeDefault),
             'Accept-Charset': 'UTF-8',
         }
         if not nosign and self.auth is not None and self.auth.can_sign_headers():
@@ -269,7 +282,7 @@ class FHIRServer(object):
         """
         url = urlparse.urljoin(self.base_uri, path)
         headers = {
-            'Accept': FHIRJSONMimeType,
+            'Accept': FHIRJSONMimeTypes.get(self.version, FHIRJSONMimeTypeDefault),
             'Accept-Charset': 'UTF-8',
         }
         if not nosign and self.auth is not None and self.auth.can_sign_headers():
@@ -301,6 +314,7 @@ class FHIRServer(object):
         """ Return current state.
         """
         return {
+            'version': self.version,
             'base_uri': self.base_uri,
             'auth_type': self.auth.auth_type if self.auth is not None else 'none',
             'auth': self.auth.state if self.auth is not None else None,
@@ -310,6 +324,7 @@ class FHIRServer(object):
         """ Update ivars from given state information.
         """
         assert state
+        self.version = state.get('version', self.version)
         self.base_uri = state.get('base_uri') or self.base_uri
         self.auth = FHIRAuth.create(state.get('auth_type'), state=state.get('auth'))
     
